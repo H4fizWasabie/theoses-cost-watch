@@ -1,5 +1,18 @@
 export type DataHandling = "zdr" | "cache_only" | "trains" | "unknown";
 
+// Prompt-cache reliability cannot be read from OpenRouter's own pricing data: every backend
+// for a given model reports the same cache_read/prompt ratio (confirmed live against
+// /api/v1/models/.../endpoints for z-ai/glm-5.3-flash — DeepInfra, Morph, GMICloud, etc. all
+// show the identical ~0.2x rate), which is OpenRouter's standard billing convention, not a
+// signal that a backend's own KV-cache/prefix-caching actually delivers hits. The only way to
+// tell providers apart here is by observing real generation logs over time (theoses2's own
+// dashboard showed GMICloud landing occasional cache credits for GLM 5.3 Flash while Morph
+// never did, across many consecutive calls). Rather than guess or add unproven telemetry,
+// providers a human has actually confirmed don't cache well for a given model go in this
+// explicit, per-model exclude list (cost-watch.json's "unreliable_cache" key) — the same
+// "explicit config change required" philosophy already used for dataHandling and the
+// quantization floor below.
+
 export interface CatalogueEntry {
   model: string;
   provider: string;
@@ -120,9 +133,10 @@ export function rankCatalogueEntries(entries: CatalogueEntry[]): CatalogueEntry[
 export function chooseProviderOrder(
   entries: CatalogueEntry[],
   maxPins = 5,
+  unreliableCacheProviders: ReadonlySet<string> = new Set(),
 ): string[] {
   return rankCatalogueEntries(entries
-    .filter((entry) => entry.dataHandling !== "trains"))
+    .filter((entry) => entry.dataHandling !== "trains" && !unreliableCacheProviders.has(entry.provider)))
     .slice(0, maxPins)
     .map((entry) => entry.provider);
 }

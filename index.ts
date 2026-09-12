@@ -22,6 +22,9 @@ interface WatchConfig {
   catalogue_refresh_minutes?: number;
   data_handling?: Record<string, DataHandling>;
   models?: string[];
+  // Per-model list of provider names a human has confirmed don't cache reliably for that
+  // model (see core.ts's comment on DataHandling for why this can't be inferred from pricing).
+  unreliable_cache?: Record<string, string[]>;
 }
 
 interface WatchState {
@@ -93,7 +96,8 @@ async function performRefresh(force: boolean): Promise<WatchState> {
       const response = await fetch(`https://openrouter.ai/api/v1/models/${model}/endpoints`);
       if (!response.ok) throw new Error(`OpenRouter returned HTTP ${response.status}`);
       const entries = parseEndpointPayload(model, (await response.json()) as EndpointPayload, config.data_handling);
-      const order = chooseProviderOrder(entries);
+      const unreliableCacheProviders = new Set(config.unreliable_cache?.[model] ?? []);
+      const order = chooseProviderOrder(entries, 5, unreliableCacheProviders);
       if (!order.length) throw new Error("No eligible complete provider pricing found");
       orders[model] = order;
     } catch (error) {
