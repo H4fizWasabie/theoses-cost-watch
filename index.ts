@@ -51,6 +51,16 @@ interface WatchConfig {
   // throughput in the endpoints API payload, so a speed preference has to be stated
   // by hand rather than inferred from cache price.
   preferred_providers?: Record<string, string[]>;
+  // Per-model fixed provider order that bypasses cost ranking entirely (2026-09-13,
+  // abah's GLM 5.3 Flash decision: Relace/StreamLake/Parasail chosen by hand after
+  // reviewing real cache-hit and throughput data, not by chooseProviderOrder's price
+  // ranking). A model listed here skips fetching/ranking OpenRouter's endpoint catalogue
+  // altogether — the array is sent as-is. Sticky failover (before_provider_request /
+  // recordOutcome) still runs on top of this fixed list, so it can only ever rotate
+  // among these named providers: allow_fallbacks stays false, so OpenRouter never serves
+  // a provider outside this array, which keeps servedIdx = base.indexOf(served) inside
+  // the fixed list too.
+  manual_provider_order?: Record<string, string[]>;
   // Sticky provider (2026-09-13): OpenRouter flaps between pins on any top-pin hiccup
   // (it applies its own short cooldowns), so each request can land on a different
   // provider. The extension now observes who ACTUALLY serves each request — OpenRouter
@@ -222,6 +232,11 @@ async function performRefresh(force: boolean): Promise<WatchState> {
 
   for (const model of configured) {
     try {
+      const manualOrder = config.manual_provider_order?.[model];
+      if (manualOrder?.length) {
+        orders[model] = manualOrder;
+        continue;
+      }
       const response = await fetch(`https://openrouter.ai/api/v1/models/${model}/endpoints`);
       if (!response.ok) throw new Error(`OpenRouter returned HTTP ${response.status}`);
       const entries = parseEndpointPayload(model, (await response.json()) as EndpointPayload, config.data_handling);
