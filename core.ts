@@ -19,6 +19,12 @@ export interface CatalogueEntry {
   input: number;
   output: number;
   cache: number;
+  // cache_read / prompt price ratio. Higher is better at equal cache price:
+  // the same cache price measured against a cheaper input. Uniform across
+  // almost all OpenRouter backends (~0.2, OpenRouter's billing convention),
+  // so it only discriminates in the rare cases that deviate (CoreWeave 0.333,
+  // Makora 0.171 for GLM as of 2026-09-13).
+  cacheRate?: number;
   discount: number;
   dataHandling: DataHandling;
   quantization?: string;
@@ -53,13 +59,22 @@ export interface EndpointPayload {
 // evidence those are worse.
 const precisionWorseThanFP8 = new Set(["fp4", "fp2", "fp1", "int4", "int2"]);
 
-function precisionTier(quantization: string | undefined): number {
-  return quantization && precisionWorseThanFP8.has(quantization.toLowerCase()) ? 1 : 0;
-}
+// Quantizations abah accepts as first-class (2026-09-13 plan: fp8 as the floor for
+// first-class pins; anything explicitly listed here ranks tier 0). "unknown"/missing
+// quantization is NOT here — it's handled by the per-model quantization policy below.
+const fp8OrBetter = new Set(["fp8", "fp16", "bf16", "fp32"]);
 
-// Relative cost difference below which two providers count as "similarly
-// priced" and defer to health/uptime/latency instead of raw cost order.
-const TIE_BREAK_TOLERANCE = 0.02;
+// "require": only fp8+ endpoints are eligible as primary pins; everything else
+//   (unknown/missing quantization) may only appear as trailing fallback pins.
+// "prefer": fp8+ endpoints rank ahead of unknown-quantization ones, but unknown
+//   is still eligible for primary pins (pre-2026-09-13 behaviour, kept for
+//   models like DeepSeek where the official endpoint doesn't report quantization).
+// "any": no quantization gate beyond the fp4/int4 precision floor above.
+export type QuantPolicy = "require" | "prefer" | "any";
+
+function isQuantUnknown(quantization: string | undefined): boolean {
+  return !quantization || !fp8OrBetter.has(quantization.toLowerCase());
+}
 
 const numberValue = (value: unknown): number => {
   const parsed = typeof value === "number" ? value : Number(value);
@@ -86,12 +101,15 @@ export function parseEndpointPayload(
     const provider = providerName(endpoint.name);
     const pricing = endpoint.pricing;
     if (!provider || !pricing) return [];
+    const input = numberValue(pricing.prompt);
+    const cache = numberValue(pricing.input_cache_read);
     return [{
       model,
       provider,
-      input: numberValue(pricing.prompt),
+      input,
       output: numberValue(pricing.completion),
-      cache: numberValue(pricing.input_cache_read),
+      cache,
+      cacheRate: input > 0 ? cache / input : undefined,
       discount: typeof pricing.discount === "number" ? pricing.discount : 0,
       dataHandling: dataHandling[provider] ?? "unknown",
       quantization: typeof endpoint.quantization === "string" ? endpoint.quantization : undefined,
@@ -102,43 +120,87 @@ export function parseEndpointPayload(
   });
 }
 
+// Lexicographic comparator (abah's 2026-09-13 spec): cache price asc -> cache
+// rate desc -> input asc -> output asc -> uptime bucket desc -> latency asc ->
+// provider name asc. Replaces the old min-normalized score, whose denominators
+// (set by even providers that were filtered out of the ranking) rescaled the
+// whole board on every price change, and whose uptime/latency tie-breaks on raw
+// 30-minute metrics reordered near-tied groups every refresh — the two churn
+// sources that made the pin list jump between providers.
 export function rankCatalogueEntries(entries: CatalogueEntry[]): CatalogueEntry[] {
-  const complete = entries.filter((entry) => entry.input > 0 && entry.cache > 0 && entry.output > 0);
+  // Free/zero cache reads are the BEST case, not incomplete — the old
+  // cache > 0 requirement demoted DeepSeek's official endpoint (cache 0.00)
+  // below paid-cache providers.
+  const complete = entries.filter((entry) => entry.input > 0 && entry.output > 0);
   const incomplete = entries.filter((entry) => !complete.includes(entry));
   if (complete.length === 0) return entries;
 
-  const minimum = (field: "input" | "cache" | "output") => Math.min(...complete.map((entry) => entry[field]));
-  const minInput = minimum("input");
-  const minCache = minimum("cache");
-  const minOutput = minimum("output");
-  return [...complete].sort((a, b) => {
-    const score = (entry: CatalogueEntry) => entry.input / minInput + entry.cache / minCache + entry.output / minOutput;
-    const health = (entry: CatalogueEntry) => entry.status === undefined ? 0 : entry.status === 0 ? 1 : -1;
-    const uptime = (entry: CatalogueEntry) => entry.uptime ?? -Infinity;
-    const latency = (entry: CatalogueEntry) => entry.latency ?? Infinity;
+  // Bucketed uptime instead of raw values: raw 30-minute metrics (99.68 vs
+  // 99.75) churned tie groups on every refresh.
+  const uptimeBucket = (entry: CatalogueEntry) =>
+    entry.uptime === undefined ? -1 : entry.uptime >= 99.9 ? 3 : entry.uptime >= 99 ? 2 : entry.uptime >= 95 ? 1 : 0;
+  const latency = (entry: CatalogueEntry) => entry.latency ?? Infinity;
 
-    const tierDiff = precisionTier(a.quantization) - precisionTier(b.quantization);
-    if (tierDiff !== 0) return tierDiff;
-
-    const scoreA = score(a);
-    const scoreB = score(b);
-    const relativeDiff = Math.abs(scoreA - scoreB) / Math.max(scoreA, scoreB);
-    if (relativeDiff > TIE_BREAK_TOLERANCE) return scoreA - scoreB;
-
-    return health(b) - health(a) || uptime(b) - uptime(a)
-      || latency(a) - latency(b) || a.cache - b.cache || a.output - b.output || a.input - b.input;
-  }).concat(incomplete);
+  return [...complete].sort((a, b) =>
+    a.cache - b.cache
+    || (b.cacheRate ?? 0) - (a.cacheRate ?? 0)
+    || a.input - b.input
+    || a.output - b.output
+    || uptimeBucket(b) - uptimeBucket(a)
+    || latency(a) - latency(b)
+    || a.provider.localeCompare(b.provider)
+  ).concat(incomplete);
 }
 
 export function chooseProviderOrder(
   entries: CatalogueEntry[],
-  maxPins = 5,
+  maxPins = 3,
   unreliableCacheProviders: ReadonlySet<string> = new Set(),
+  quantPolicy: QuantPolicy = "prefer",
+  fallbackPins = 2,
+  preferredProviders: ReadonlySet<string> = new Set(),
 ): string[] {
-  return rankCatalogueEntries(entries
-    .filter((entry) => entry.dataHandling !== "trains" && !unreliableCacheProviders.has(entry.provider)))
-    .slice(0, maxPins)
-    .map((entry) => entry.provider);
+  // Precise cheapest-cache ranker. "Cheapest first" here means the primary pin
+  // list is stable and cost-tiered: pins 2..N are only reached on failure, so a
+  // tighter maxPins limits KV-cache fragmentation without losing redundancy.
+  const eligible = entries.filter((entry) =>
+    entry.dataHandling !== "trains"
+    && !unreliableCacheProviders.has(entry.provider)
+    && (entry.status === undefined || entry.status === 0)
+    && !precisionWorseThanFP8.has(entry.quantization?.toLowerCase() ?? ""));
+  const verified = eligible.filter((entry) => !isQuantUnknown(entry.quantization));
+  const unverified = eligible.filter((entry) => isQuantUnknown(entry.quantization));
+
+  // Explicit human pins (abah, 2026-09-13): providers named in preferredProviders
+  // rank TIER 0 — ahead of the cost ranking — but only if they clear the SAME
+  // eligibility gate above (fp4 precision floor, data-handling, status). An
+  // explicit pin expresses a judgement the ranker cannot see: OpenRouter publishes
+  // per-provider throughput on its model PAGES but not in the endpoints API
+  // payload (throughput_last_30m is null for every GLM 5.3 Flash endpoint), so
+  // cache price is the only machine-readable key and it cannot express
+  // "this provider is ~2x faster". See cost-watch.json's preferred_providers.
+  const forced = rankCatalogueEntries(eligible.filter((entry) => preferredProviders.has(entry.provider)))
+    .map((entry) => entry.provider)
+    .slice(0, maxPins);
+  const restSlots = Math.max(0, maxPins - forced.length);
+  const notForced = (provider: string) => !forced.includes(provider);
+
+  if (quantPolicy === "any") {
+    const rest = rankCatalogueEntries(eligible).map((e) => e.provider).filter(notForced).slice(0, restSlots);
+    return [...forced, ...rest];
+  }
+
+  const primary = quantPolicy === "require" ? verified : verified.concat(unverified);
+  const pinned = rankCatalogueEntries(primary).map((e) => e.provider).filter(notForced).slice(0, restSlots);
+
+  // "require": unknown-quantization providers (e.g. Relace/Wafer/Makora for GLM)
+  // are never primary pins, but may appear as trailing fallbacks — reached only
+  // when every fp8 pin fails, so fp8 discipline is kept without hard-failing if
+  // all fp8 endpoints go down at once.
+  const fallback = quantPolicy === "require"
+    ? rankCatalogueEntries(unverified).map((e) => e.provider).filter((p) => notForced(p) && !pinned.includes(p)).slice(0, fallbackPins)
+    : [];
+  return [...forced, ...pinned, ...fallback];
 }
 
 /**
