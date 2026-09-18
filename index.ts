@@ -127,6 +127,11 @@ const sticky = new Map<string, StickyEntry>();
 // compares the serving provider against the primary we led with).
 const lastBase = new Map<string, string[]>();
 const lastPrimary = new Map<string, string>();
+// x-generation-id captured at after_provider_response time (headers arrive as soon as the
+// stream starts, well before a stream-duration timeout could ever fire) — kept so a later
+// message_end stream-timeout can still identify which provider was actually serving the
+// request that never finished. See the message_end handler below.
+const lastGenId = new Map<string, string>();
 const inFlightGenPolls = new Set<string>();
 
 const DEFAULT_DEMOTE_THRESHOLD = 2;
@@ -179,33 +184,42 @@ async function recordOutcome(modelId: string, base: string[], primary: string, s
   sticky.set(modelId, entry);
 }
 
-// Fire-and-forget attribution: OpenRouter's generation endpoint names the serving
-// provider but only indexes the generation a few seconds after completion, hence the
-// 404-then-retry loop. Never blocks or fails the request itself.
-function pollServedProvider(genId: string, modelId: string, base: string[], primary: string): void {
-  void (async () => {
-    for (let attempt = 0; attempt < GEN_POLL_ATTEMPTS; attempt++) {
-      await new Promise((r) => setTimeout(r, GEN_POLL_DELAY_MS));
-      try {
-        const key = await openRouterKey();
-        if (!key) return;
-        const res = await fetch(`https://openrouter.ai/api/v1/generation?id=${encodeURIComponent(genId)}`, {
-          headers: { Authorization: `Bearer ${key}` },
-        });
-        if (res.status === 404) continue; // not indexed yet
-        if (!res.ok) return;
-        const data = ((await res.json()) as { data?: { provider_name?: string; model?: string } }).data;
-        const served = data?.provider_name;
-        if (!served) return;
-        // Guard against cross-model mis-attribution (ctx.model is the session's model).
-        if (data?.model && !data.model.startsWith(modelId)) return;
-        await recordOutcome(modelId, base, primary, served);
-        return;
-      } catch {
-        // transient network error — next attempt
-      }
+/**
+ * Resolves which provider actually served a generation, via OpenRouter's generation-lookup
+ * endpoint. Returns undefined if the generation never gets indexed within the retry budget, the
+ * lookup fails, or (guarding against cross-model mis-attribution) the indexed model doesn't
+ * match. Shared by the success-path attribution below and the stream-timeout handler, which both
+ * need the same "who actually served this" answer for a genId captured earlier.
+ */
+async function resolveServedProvider(genId: string, modelId: string): Promise<string | undefined> {
+  for (let attempt = 0; attempt < GEN_POLL_ATTEMPTS; attempt++) {
+    await new Promise((r) => setTimeout(r, GEN_POLL_DELAY_MS));
+    try {
+      const key = await openRouterKey();
+      if (!key) return undefined;
+      const res = await fetch(`https://openrouter.ai/api/v1/generation?id=${encodeURIComponent(genId)}`, {
+        headers: { Authorization: `Bearer ${key}` },
+      });
+      if (res.status === 404) continue; // not indexed yet
+      if (!res.ok) return undefined;
+      const data = ((await res.json()) as { data?: { provider_name?: string; model?: string } }).data;
+      const served = data?.provider_name;
+      if (!served) return undefined;
+      if (data?.model && !data.model.startsWith(modelId)) return undefined;
+      return served;
+    } catch {
+      // transient network error — next attempt
     }
-  })();
+  }
+  return undefined;
+}
+
+/** Fire-and-forget attribution for a normal (status < 400) response: never blocks or fails the
+ * request itself. */
+function pollServedProvider(genId: string, modelId: string, base: string[], primary: string): void {
+  void resolveServedProvider(genId, modelId).then((served) => {
+    if (served) void recordOutcome(modelId, base, primary, served);
+  });
 }
 
 let inFlightRefresh: Promise<WatchState> | undefined;
@@ -401,12 +415,51 @@ export default function theosesCostWatch(theoses: ExtensionAPI) {
       return;
     }
     const genId = headerValue(event.headers, "x-generation-id");
-    if (!genId || inFlightGenPolls.has(genId)) return;
+    if (!genId) return;
+    lastGenId.set(model.id, genId);
+    if (inFlightGenPolls.has(genId)) return;
     inFlightGenPolls.add(genId);
     try {
       pollServedProvider(genId, model.id, base, primary);
     } finally {
       setTimeout(() => inFlightGenPolls.delete(genId), 30_000).unref?.();
     }
+  });
+
+  /**
+   * Catches theoses2's stream-duration watchdog failure ("Stream exceeded the Ns max
+   * duration..." — packages/ai/src/api/openai-completions.ts) — a failure mode
+   * after_provider_response structurally cannot see, because that hook fires as soon as
+   * response headers arrive (the stream has already returned 200 and "succeeded" by
+   * after_provider_response's own signal) — long before a stream that never finishes trickling
+   * would trip the client-side timeout. Without this, a provider that reliably starts responding
+   * but never finishes looks perfectly healthy to cost-watch forever, and sticky demotion never
+   * triggers no matter how often it happens (2026-09-18 incident: near-exclusively hitting one
+   * pinned provider for z-ai/glm-5.3-flash with no visibility into which one).
+   *
+   * Uses the genId captured by after_provider_response for this model to identify which
+   * provider was actually serving the request that never completed, then records it as a real
+   * failure (recordOutcome's demotion counter) instead of leaving it invisible.
+   */
+  theoses.on("message_end", (event) => {
+    const message = event.message as { role?: string; provider?: string; model?: string; stopReason?: string; errorMessage?: string };
+    if (message.role !== "assistant" || message.provider !== "openrouter") return;
+    if (message.stopReason !== "error" || !message.errorMessage?.includes("Stream exceeded")) return;
+    const modelId = message.model;
+    if (!modelId) return;
+
+    const base = lastBase.get(modelId);
+    const primary = lastPrimary.get(modelId);
+    const genId = lastGenId.get(modelId);
+
+    void (async () => {
+      const served = genId ? await resolveServedProvider(genId, modelId) : undefined;
+      console.error(`[cost-watch] STREAM_TIMEOUT model=${modelId} servedBy=${served ?? "unknown"} genId=${genId ?? "none"}`);
+      if (base?.length && primary) {
+        // Always a failure regardless of who served it — the point of this event is that the
+        // request never completed, independent of which provider was leading.
+        await recordOutcome(modelId, base, primary, "");
+      }
+    })();
   });
 }
