@@ -262,3 +262,22 @@ export function applyRoutingPayload(
     provider: { ...provider, order, allow_fallbacks: false },
   };
 }
+
+// Status codes that describe a problem with THIS specific request (malformed body, payload
+// too large, content rejected by moderation) rather than the serving provider's health.
+// `after_provider_response` only carries `status`/`headers` — no response body — so a status
+// code is the only signal available to tell these apart; counting a request-shape failure
+// against a provider would eventually demote a perfectly healthy, cheap provider purely
+// because one call happened to be malformed on that pin, the same "hoisted a bad signal into
+// the ranking" failure class the fp8/Relace-Wafer incident was about. Deliberately narrow:
+// only codes that are unambiguously about the request, not about capacity or availability —
+// 429 (rate limit) and every 5xx (including OpenRouter's own 529 "overloaded") stay in scope,
+// since those genuinely do indicate the provider is the problem.
+const REQUEST_SHAPE_STATUS_CODES = new Set([400, 413, 422]);
+
+/** Whether a failed response's status code should count against the serving provider's sticky
+ * reliability score (recordOutcome in index.ts), vs. being a request-shape problem that would
+ * fail identically on any provider. */
+export function isProviderHealthFailure(status: number): boolean {
+  return status >= 400 && !REQUEST_SHAPE_STATUS_CODES.has(status);
+}

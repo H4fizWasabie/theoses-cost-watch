@@ -8,6 +8,7 @@ import {
   applyModelOverrideOrders,
   applyRoutingPayload,
   chooseProviderOrder,
+  isProviderHealthFailure,
   parseEndpointPayload,
   type DataHandling,
   type EndpointPayload,
@@ -392,7 +393,11 @@ export default function theosesCostWatch(theoses: ExtensionAPI) {
     const primary = lastPrimary.get(model.id);
     if (!base?.length || !primary) return;
     if (event.status >= 400) {
-      void recordOutcome(model.id, base, primary, "");
+      // Only count status codes that actually indicate a provider-side problem (see core.ts's
+      // isProviderHealthFailure) — a request-shape failure (malformed body, oversized payload,
+      // moderation rejection) would fail identically on every provider and shouldn't push the
+      // sticky ranking away from a perfectly healthy pin.
+      if (isProviderHealthFailure(event.status)) void recordOutcome(model.id, base, primary, "");
       return;
     }
     const genId = headerValue(event.headers, "x-generation-id");
