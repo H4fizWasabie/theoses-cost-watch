@@ -258,7 +258,7 @@ async function performRefresh(force: boolean): Promise<WatchState> {
       const unreliableCacheProviders = new Set(config.unreliable_cache?.[model] ?? []);
       const preferredProviders = new Set(config.preferred_providers?.[model] ?? []);
       const quantPolicy = config.quantization_policy?.[model] ?? config.quantization_policy?.default ?? "prefer";
-      const order = chooseProviderOrder(
+      let order = chooseProviderOrder(
         entries,
         config.max_pins ?? 3,
         unreliableCacheProviders,
