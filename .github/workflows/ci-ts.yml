@@ -3,39 +3,19 @@ name: ci-typecheck
 on:
   push:
     branches: [main]
-    paths: ["*.ts", ".github/workflows/ci-ts.yml"]
+    paths: ["*.ts", "types/**", ".github/workflows/ci-ts.yml", "package.json", "tsconfig.ci.json"]
   pull_request:
-    paths: ["*.ts", ".github/workflows/ci-ts.yml"]
+    paths: ["*.ts", "types/**", ".github/workflows/ci-ts.yml", "package.json", "tsconfig.ci.json"]
 
 jobs:
   typecheck:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-
-      - name: Install theoses2 typings (src only, no build)
-        run: git clone --depth 1 https://github.com/H4fizWasabie/theoses2.git /tmp/theoses2
-
-      - name: Run tsc --noEmit over extension sources
-        run: |
-          cat > tsconfig.ci.json <<'EOF'
-          {
-            "compilerOptions": {
-              "target": "ES2022",
-              "module": "NodeNext",
-              "moduleResolution": "NodeNext",
-              "allowImportingTsExtensions": true,
-              "noEmit": true,
-              "strict": true,
-              "skipLibCheck": true,
-              "types": ["node"],
-              "paths": { "theoses-coding-agent": ["/tmp/theoses2/src/index.ts"] }
-            },
-            "include": ["*.ts"]
-          }
-          EOF
-          npx -y typescript@5.6 tsc -p tsconfig.ci.json
+      - name: Install pinned deps (typescript 5.9.3, typebox 1.3.7, @types/node 22)
+        run: npm install --no-fund --no-audit
+      - name: tsc --noEmit
+        run: npx tsc -p tsconfig.ci.json
